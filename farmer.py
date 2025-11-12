@@ -1,638 +1,720 @@
 #!/usr/bin/env python3
 """
-rpg_gui_pyqt.py
-
-A short single-file PyQt5 GUI for a small text-RPG:
-- Character creation (Warrior, Mage, Rogue)
-- Village -> Haunted Forest -> Enchanted Castle progression
-- Turn-based combat with buttons (Attack, Defend, Magic, Item, Flee)
-- Inventory dialog, loot, and branching decisions with 3 endings (Good / Neutral / Bad)
-- Input and states validated, robust to edge cases.
-
-Dependencies:
-    pip install pyqt5
+Top-down 2D RPG demo using Pygame.
+Single-file demo with:
+ - Three areas: Village -> Forest -> Castle (different colored maps)
+ - Player movement (arrow keys / WASD)
+ - NPC interaction (help spirit or not)
+ - Items to pick up (potions, charm)
+ - Inventory screen (I)
+ - Collision-triggered turn-based combat screen
+ - Branching final choice at Castle with 3 endings (GOOD / NEUTRAL / BAD)
+ - Simple sprites drawn programmatically (no external assets)
+ - Beginner-friendly, commented code.
 
 Run:
-    python rpg_gui_pyqt.py
+    python topdown_rpg_pygame.py
 """
 
-import sys
+import pygame
 import random
+import sys
 from dataclasses import dataclass, field
-from typing import List, Callable, Optional
+from typing import List, Optional, Tuple
 
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QTextEdit, QListWidget, QMessageBox, QDialog, QLineEdit, QComboBox
-)
-from PyQt5.QtCore import Qt
+# ---- Configuration ----
+SCREEN_WIDTH = 960
+SCREEN_HEIGHT = 640
+FPS = 60
 
-# ---------------------------
-# Data models (dataclasses)
-# ---------------------------
+TILE_SIZE = 32
+PLAYER_SPEED = 160  # pixels per second
+
+FONT_NAME = "freesansbold.ttf"
+
+# Colors
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+VILLAGE_BG = (200, 230, 200)
+FOREST_BG = (40, 80, 40)
+CASTLE_BG = (180, 180, 210)
+PLAYER_COLOR = (60, 130, 200)
+NPC_COLOR = (220, 200, 60)
+ENEMY_COLOR = (200, 60, 60)
+ITEM_COLOR = (200, 120, 200)
+HIGHLIGHT = (255, 220, 60)
+
+# ---- Game Data Models ----
 
 @dataclass
-class Player:
+class Item:
     name: str
-    pclass: str
-    strength: int = 5
+    description: str
+
+@dataclass
+class PlayerState:
+    name: str = "Hero"
+    pclass: str = "Warrior"
+    strength: int = 8
     agility: int = 5
-    magic: int = 5
-    max_hp: int = 30
-    max_mp: int = 15
-    hp: int = 30
-    mp: int = 15
-    inventory: List[str] = field(default_factory=list)
+    magic: int = 2
+    max_hp: int = 40
+    hp: int = 40
+    max_mp: int = 10
+    mp: int = 10
+    inventory: List[Item] = field(default_factory=list)
     gold: int = 10
-    defending: bool = False
     helped_spirit: bool = False
     has_charm: bool = False
 
-    def is_alive(self) -> bool:
-        return self.hp > 0
-
-    def show_short(self) -> str:
-        inv = ", ".join(self.inventory) if self.inventory else "Empty"
-        return f"HP: {self.hp}/{self.max_hp}  MP: {self.mp}/{self.max_mp}  Gold: {self.gold}\nSTR:{self.strength} AGI:{self.agility} MAG:{self.magic}\nInventory: {inv}"
-
 @dataclass
-class Enemy:
+class GameObject:
+    x: float
+    y: float
+    w: int
+    h: int
     name: str
-    hp: int
-    strength: int
-    agility: int
-    magic: int
-    level: int = 1
-    loot: List[str] = field(default_factory=list)
-    special: Optional[Callable[['Player', 'Enemy', 'MainWindow'], None]] = None
 
-    def is_alive(self) -> bool:
-        return self.hp > 0
+    def rect(self) -> pygame.Rect:
+        return pygame.Rect(int(self.x), int(self.y), self.w, self.h)
 
-# ---------------------------
-# Utility functions
-# ---------------------------
+# ---- Utilities ----
 
-def clamp(n, a, b): return max(a, min(b, n))
-
-def calc_damage(att_str, base=3, variance=3, magic=False, att_mag=0):
-    if magic:
-        raw = base + att_mag + random.randint(0, variance)
+def draw_text(surface, text, x, y, size=20, color=BLACK, center=False):
+    font = pygame.font.Font(FONT_NAME, size)
+    rendered = font.render(text, True, color)
+    rect = rendered.get_rect()
+    if center:
+        rect.center = (x, y)
     else:
-        raw = base + att_str + random.randint(0, variance)
-    return max(0, raw)
+        rect.topleft = (x, y)
+    surface.blit(rendered, rect)
 
-def make_enemy(name: str, difficulty: int = 1) -> Enemy:
-    if name == "Goblin":
-        return Enemy("Goblin", hp=8 + difficulty*2, strength=3 + difficulty, agility=3 + difficulty, magic=0, level=difficulty, loot=["Small Potion"] if random.random() < 0.6 else [])
-    if name == "ForestWraith":
-        return Enemy("Forest Wraith", hp=14 + difficulty*3, strength=4 + difficulty, agility=4 + difficulty, magic=3 + difficulty, level=difficulty, loot=["Mana Potion"])
-    if name == "Bandit":
-        return Enemy("Bandit Leader", hp=18 + difficulty*4, strength=6 + difficulty, agility=5 + difficulty, magic=0, level=difficulty, loot=["Lucky Charm"], special=goblin_special)
-    if name == "Dragon":
-        def breath(player, enemy, mw):
-            mw.append_text("The Ancient Guardian breathes fire!")
-            dmg = 12 + enemy.level * 2
-            if player.defending:
-                dmg //= 2
-            player.hp -= dmg
-            player.hp = clamp(player.hp, 0, player.max_hp)
-            mw.append_text(f"You take {dmg} fire damage.")
-        return Enemy("Ancient Guardian", hp=45 + difficulty*10, strength=8 + difficulty*2, agility=4 + difficulty, magic=8 + difficulty, level=difficulty+3, loot=["Ancient Artifact"], special=breath)
-    return Enemy("Wolf", hp=10 + difficulty*2, strength=4 + difficulty, agility=5 + difficulty, magic=0, level=difficulty)
+def clamp(n, a, b):
+    return max(a, min(b, n))
 
-def goblin_special(player: Player, enemy: Enemy, mw):
-    if player.inventory and random.random() < 0.2:
-        stolen = player.inventory.pop(0)
-        mw.append_text(f"{enemy.name} snatches your {stolen}!")
-    else:
-        mw.append_text(f"{enemy.name} tries a dirty trick but fails.")
+# ---- Scenes / Maps ----
 
-# ---------------------------
-# Dialogs
-# ---------------------------
+class MapScene:
+    """
+    Basic scene class. Subclass for Village, Forest, Castle.
+    Each scene can provide:
+    - background color
+    - obstacles (rects)
+    - NPCs, items, enemies (GameObject list)
+    """
+    def __init__(self, name, bg_color):
+        self.name = name
+        self.bg_color = bg_color
+        self.obstacles: List[pygame.Rect] = []  # blocks movement
+        self.npcs: List[GameObject] = []
+        self.items: List[Tuple[GameObject, Item]] = []
+        self.enemies: List[GameObject] = []
+        self.width = SCREEN_WIDTH
+        self.height = SCREEN_HEIGHT
 
-class CharacterDialog(QDialog):
-    """Character creation modal"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Create Character")
-        self.resize(320, 160)
-        layout = QVBoxLayout()
-        self.setLayout(layout)
+    def draw(self, surf):
+        surf.fill(self.bg_color)
+        # draw obstacles
+        for r in self.obstacles:
+            pygame.draw.rect(surf, (80, 80, 80), r)
+        # draw items
+        for go, it in self.items:
+            pygame.draw.rect(surf, ITEM_COLOR, go.rect())
+            draw_text(surf, it.name, go.x, go.y - 16, size=14)
+        # draw npcs
+        for npc in self.npcs:
+            pygame.draw.rect(surf, NPC_COLOR, npc.rect())
+            draw_text(surf, npc.name, npc.x, npc.y - 16, size=14)
+        # draw enemies
+        for en in self.enemies:
+            pygame.draw.rect(surf, ENEMY_COLOR, en.rect())
+            draw_text(surf, en.name, en.x, en.y - 16, size=14)
 
-        self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("Enter name (default: Hero)")
-        layout.addWidget(QLabel("Name:"))
-        layout.addWidget(self.name_input)
+# ---- Scenes constructors ----
 
-        layout.addWidget(QLabel("Choose Class:"))
-        self.class_select = QComboBox()
-        self.class_select.addItems(["Warrior", "Mage", "Rogue"])
-        layout.addWidget(self.class_select)
+def create_village_scene():
+    s = MapScene("Village", VILLAGE_BG)
+    # Add a shop building obstacle
+    s.obstacles.append(pygame.Rect(120, 80, 220, 140))
+    s.obstacles.append(pygame.Rect(600, 60, 260, 160))
+    # NPC: elder for tutorial
+    s.npcs.append(GameObject(480, 300, 28, 32, "Elder"))
+    # No enemies here; add an item chest
+    s.items.append((GameObject(200, 420, 24, 24, "Chest"), Item("Small Potion", "Heals 20 HP")))
+    return s
 
-        btn = QPushButton("Create")
-        btn.clicked.connect(self.accept)
-        layout.addWidget(btn)
+def create_forest_scene():
+    s = MapScene("Forest", FOREST_BG)
+    # Scatter obstacles (trees)
+    for i in range(8):
+        rx = 40 + i * 100
+        ry = 40 + (i % 3) * 120
+        s.obstacles.append(pygame.Rect(rx, ry, 48, 80))
+    # Spirit NPC
+    s.npcs.append(GameObject(720, 120, 28, 32, "Trapped Spirit"))
+    # enemies (patrolling positions)
+    s.enemies.append(GameObject(300, 240, 28, 28, "Goblin"))
+    s.enemies.append(GameObject(500, 420, 28, 28, "Bandit"))
+    # an extra item
+    s.items.append((GameObject(100, 520, 24, 24, "Glint"), Item("Lucky Charm", "Feels lucky. Small heal + gold.")))
+    return s
 
-    def get_values(self):
-        name = self.name_input.text().strip() or "Hero"
-        pclass = self.class_select.currentText()
-        return name, pclass
+def create_castle_scene():
+    s = MapScene("Castle", CASTLE_BG)
+    # Large wall obstacle
+    s.obstacles.append(pygame.Rect(0, 100, SCREEN_WIDTH, 40))
+    # guard (bandit)
+    s.enemies.append(GameObject(420, 160, 36, 36, "Bandit Leader"))
+    # Inner guardian (placed near center; interaction will start final event)
+    s.npcs.append(GameObject(480, 320, 48, 60, "Ancient Guardian"))
+    # Castle item (key)
+    s.items.append((GameObject(200, 200, 24, 24, "Banner"), Item("Spirit Charm", "A charm granted by a grateful spirit.")))
+    return s
 
-# ---------------------------
-# Inventory Dialog
-# ---------------------------
+# ---- Combat system (turn-based visual) ----
 
-class InventoryDialog(QDialog):
-    def __init__(self, player: Player, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Inventory")
-        self.resize(360, 300)
+class CombatScreen:
+    """
+    Minimal turn-based combat screen. Uses player's stats and a simple enemy stat model.
+    Displayed when player collides an enemy.
+    Controls: keys A=Attack, D=Defend, M=Magic, I=Use Item, F=Flee
+    """
+    def __init__(self, screen, clock, player: PlayerState, enemy_name: str):
+        self.screen = screen
+        self.clock = clock
         self.player = player
-        layout = QVBoxLayout()
-        self.setLayout(layout)
+        self.enemy_name = enemy_name
+        # enemy stats simple factory
+        self.enemy = self.make_enemy(enemy_name)
+        self.log: List[str] = []
+        self.player.defending = False  # temp field used in combat only
+        self.finished = False
+        self.victory = False
 
-        self.list_widget = QListWidget()
-        layout.addWidget(self.list_widget)
+    def make_enemy(self, name):
+        if name == "Goblin":
+            return {"name": "Goblin", "hp": 20, "str": 4, "agi": 3, "lvl": 1}
+        if name == "Bandit" or name == "Bandit Leader":
+            return {"name": "Bandit Leader", "hp": 30, "str": 6, "agi": 4, "lvl": 2}
+        if name == "Ancient Guardian":
+            return {"name": "Ancient Guardian", "hp": 70, "str": 10, "agi": 3, "lvl": 5}
+        # default wolf
+        return {"name": "Wolf", "hp": 18, "str": 5, "agi": 5, "lvl": 1}
 
-        btn_layout = QHBoxLayout()
-        self.use_btn = QPushButton("Use")
-        self.discard_btn = QPushButton("Discard")
-        self.close_btn = QPushButton("Close")
-        btn_layout.addWidget(self.use_btn)
-        btn_layout.addWidget(self.discard_btn)
-        btn_layout.addWidget(self.close_btn)
-        layout.addLayout(btn_layout)
+    def append(self, text):
+        print("[COMBAT]", text)
+        self.log.append(text)
+        if len(self.log) > 9:
+            self.log.pop(0)
 
-        self.close_btn.clicked.connect(self.accept)
-        self.use_btn.clicked.connect(self.use_item)
-        self.discard_btn.clicked.connect(self.discard_item)
-        self.refresh()
+    def draw(self):
+        # background and UI
+        self.screen.fill((30, 30, 40))
+        draw_text(self.screen, f"Combat: {self.player.name} vs {self.enemy['name']}", SCREEN_WIDTH//2, 20, size=28, color=WHITE, center=True)
+        # player box
+        pygame.draw.rect(self.screen, (50, 100, 150), (60, 80, 360, 220))
+        draw_text(self.screen, f"{self.player.name} ({self.player.pclass})", 120, 92, size=20, color=WHITE)
+        draw_text(self.screen, f"HP: {self.player.hp}/{self.player.max_hp}", 120, 120, size=18, color=WHITE)
+        draw_text(self.screen, f"MP: {self.player.mp}/{self.player.max_mp}", 120, 148, size=18, color=WHITE)
+        # enemy box
+        pygame.draw.rect(self.screen, (140, 50, 50), (540, 80, 360, 220))
+        draw_text(self.screen, f"{self.enemy['name']}", 640, 92, size=20, color=WHITE)
+        draw_text(self.screen, f"HP: {self.enemy['hp']}", 640, 120, size=18, color=WHITE)
 
-    def refresh(self):
-        self.list_widget.clear()
-        for it in self.player.inventory:
-            self.list_widget.addItem(it)
+        # actions hint
+        draw_text(self.screen, "Actions: [A]ttack  [D]efend  [M]agic  [I]tem  [F]lee", SCREEN_WIDTH//2, 320, size=20, center=True)
 
-    def use_item(self):
-        idx = self.list_widget.currentRow()
-        if idx < 0:
-            QMessageBox.information(self, "Select", "Select an item to use.")
-            return
-        item = self.player.inventory.pop(idx)
-        # apply effects
-        if item == "Small Potion":
-            heal = min(self.player.max_hp - self.player.hp, 20)
-            self.player.hp += heal
-            QMessageBox.information(self, "Healed", f"You heal {heal} HP.")
-        elif item == "Mana Potion":
-            restore = min(self.player.max_mp - self.player.mp, 12)
-            self.player.mp += restore
-            QMessageBox.information(self, "MP", f"You recover {restore} MP.")
-        elif item == "Lucky Charm":
-            self.player.hp = min(self.player.max_hp, self.player.hp + 8)
-            self.player.gold += 5
-            QMessageBox.information(self, "Lucky Charm", "HP +8, Gold +5.")
-        elif item == "Spirit Charm":
-            self.player.has_charm = True
-            QMessageBox.information(self, "Spirit Charm", "You feel protected.")
-        else:
-            QMessageBox.information(self, "Used", f"You used {item}.")
-        self.refresh()
+        # combat log
+        for i, line in enumerate(self.log):
+            draw_text(self.screen, line, 60, 360 + i * 22, size=18, color=WHITE)
 
-    def discard_item(self):
-        idx = self.list_widget.currentRow()
-        if idx < 0:
-            QMessageBox.information(self, "Select", "Select an item to discard.")
-            return
-        item = self.player.inventory.pop(idx)
-        QMessageBox.information(self, "Discarded", f"You discarded {item}.")
-        self.refresh()
-
-# ---------------------------
-# Main Window (Game)
-# ---------------------------
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Short RPG - PyQt GUI")
-        self.resize(800, 520)
-
-        self.player: Optional[Player] = None
-        self.current_enemy: Optional[Enemy] = None
-        self.stage = "start"  # start -> village -> forest -> castle -> done
-
-        # central layout
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QHBoxLayout()
-        central.setLayout(main_layout)
-
-        # Left: story / logs
-        left_box = QVBoxLayout()
-        main_layout.addLayout(left_box, 3)
-
-        self.story = QTextEdit()
-        self.story.setReadOnly(True)
-        left_box.addWidget(QLabel("Story / Log"))
-        left_box.addWidget(self.story)
-
-        # action buttons area
-        self.action_group = QGroupBox("Actions")
-        ag_layout = QHBoxLayout()
-        self.action_group.setLayout(ag_layout)
-        left_box.addWidget(self.action_group)
-
-        self.btn_attack = QPushButton("Attack")
-        self.btn_defend = QPushButton("Defend")
-        self.btn_magic = QPushButton("Magic")
-        self.btn_item = QPushButton("Inventory")
-        self.btn_flee = QPushButton("Flee")
-
-        for b in (self.btn_attack, self.btn_defend, self.btn_magic, self.btn_item, self.btn_flee):
-            ag_layout.addWidget(b)
-
-        # Right: player panel
-        right_box = QVBoxLayout()
-        main_layout.addLayout(right_box, 1)
-
-        self.stat_label = QLabel("No character yet")
-        self.stat_label.setAlignment(Qt.AlignTop)
-        self.stat_label.setWordWrap(True)
-        right_box.addWidget(QLabel("Player"))
-        right_box.addWidget(self.stat_label)
-
-        # control buttons
-        right_box.addWidget(QLabel("Game Controls"))
-        self.btn_new = QPushButton("New Game")
-        self.btn_next = QPushButton("Next (Progress)")
-        right_box.addWidget(self.btn_new)
-        right_box.addWidget(self.btn_next)
-
-        # bind signals
-        self.btn_new.clicked.connect(self.start_new_game)
-        self.btn_next.clicked.connect(self.progress)
-        self.btn_attack.clicked.connect(self.player_attack)
-        self.btn_defend.clicked.connect(self.player_defend)
-        self.btn_magic.clicked.connect(self.player_magic)
-        self.btn_item.clicked.connect(self.open_inventory)
-        self.btn_flee.clicked.connect(self.player_flee)
-
-        # disable action buttons until in battle
-        self.set_battle_mode(False)
-
-        # start message
-        self.append_text("Welcome — click New Game to begin.")
-
-    # ---------------------------
-    # UI helpers
-    # ---------------------------
-    def append_text(self, text: str):
-        self.story.append(text)
-        self.story.ensureCursorVisible()
-
-    def set_battle_mode(self, in_battle: bool):
-        for b in (self.btn_attack, self.btn_defend, self.btn_magic, self.btn_item, self.btn_flee):
-            b.setEnabled(in_battle)
-        # Next shouldn't be used mid-battle
-        self.btn_next.setEnabled(not in_battle)
-
-    def refresh_stats(self):
-        if not self.player:
-            self.stat_label.setText("No character yet")
-        else:
-            self.stat_label.setText(self.player.show_short())
-
-    # ---------------------------
-    # Lifecycle
-    # ---------------------------
-    def start_new_game(self):
-        dlg = CharacterDialog(self)
-        if dlg.exec_() != QDialog.Accepted:
-            return
-        name, pclass = dlg.get_values()
-        self.player = self.create_player(name, pclass)
-        self.stage = "village"
-        self.append_text(f"Created {self.player.name} the {self.player.pclass}.")
-        self.refresh_stats()
-        self.append_text("You are in the Village. Use Next to explore.")
-        self.set_battle_mode(False)
-
-    def create_player(self, name: str, pclass: str) -> Player:
-        p = Player(name=name, pclass=pclass)
-        if pclass == "Warrior":
-            p.strength = 8; p.agility = 5; p.magic = 2; p.max_hp = 40; p.max_mp = 10
-            p.hp = p.max_hp; p.mp = p.max_mp; p.inventory = ["Small Potion", "Lucky Charm"]
-        elif pclass == "Mage":
-            p.strength = 2; p.agility = 4; p.magic = 9; p.max_hp = 26; p.max_mp = 30
-            p.hp = p.max_hp; p.mp = p.max_mp; p.inventory = ["Mana Potion", "Mana Potion"]
-        elif pclass == "Rogue":
-            p.strength = 6; p.agility = 8; p.magic = 4; p.max_hp = 32; p.max_mp = 15
-            p.hp = p.max_hp; p.mp = p.max_mp; p.inventory = ["Small Potion", "Dagger"]
-        else:
-            p.hp = p.max_hp; p.mp = p.max_mp
-        return p
-
-    # ---------------------------
-    # Game progression (village, forest, castle)
-    # ---------------------------
-
-    def progress(self):
-        if not self.player:
-            QMessageBox.information(self, "No character", "Create a character first.")
-            return
-
-        if self.stage == "village":
-            self.enter_village()
-        elif self.stage == "forest":
-            self.enter_forest()
-        elif self.stage == "castle":
-            self.enter_castle()
-        else:
-            QMessageBox.information(self, "Done", "The game is over. Start a new game.")
-        self.refresh_stats()
-
-    def enter_village(self):
-        self.append_text("You arrive at the quiet village. A small shop offers potions.")
-        btns = QMessageBox()
-        btns.setWindowTitle("Village Options")
-        btns.setText("Choose an action in the Village:")
-        buy = btns.addButton("Buy Potion (5 gold)", QMessageBox.AcceptRole)
-        rest = btns.addButton("Rest (8 gold)", QMessageBox.AcceptRole)
-        leave = btns.addButton("Leave Village", QMessageBox.RejectRole)
-        btns.exec_()
-        clicked = btns.clickedButton()
-        if clicked == buy:
-            if self.player.gold >= 5:
-                self.player.gold -= 5
-                self.player.inventory.append("Small Potion")
-                self.append_text("You bought a Small Potion.")
-            else:
-                self.append_text("Not enough gold to buy.")
-        elif clicked == rest:
-            if self.player.gold >= 8:
-                self.player.gold -= 8
-                self.player.hp = self.player.max_hp
-                self.player.mp = self.player.max_mp
-                self.append_text("You rested and restored HP/MP.")
-            else:
-                self.append_text("Not enough gold to rest.")
-        else:
-            self.append_text("You leave the village and head toward the Haunted Forest.")
-            self.stage = "forest"
-
-        self.refresh_stats()
-
-    def enter_forest(self):
-        self.append_text("The Haunted Forest greets you with chilly mist.")
-        # spirit event
-        choice = QMessageBox.question(self, "Forest Spirit", "A trapped forest spirit pleads for help. Help it?", QMessageBox.Yes | QMessageBox.No)
-        if choice == QMessageBox.Yes:
-            self.append_text("You free the spirit. It gives you a Spirit Charm.")
-            self.player.helped_spirit = True
-            self.player.inventory.append("Spirit Charm")
-            self.player.has_charm = True
-        else:
-            self.append_text("You ignore the spirit and move on. Later you find a Lucky Charm.")
-            self.player.inventory.append("Lucky Charm")
-
-        # two random encounters
-        for i in range(2):
-            et = random.choice(["Goblin", "ForestWraith", "Bandit"])
-            enemy = make_enemy(et, difficulty=1 + (i // 1))
-            self.append_text(f"A {enemy.name} appears!")
-            self.start_battle(enemy)
-            if not self.player.is_alive():
-                self.game_over("BAD", "You were defeated in the forest.")
-                return
-        self.append_text("You made it through the forest and head toward the Enchanted Castle.")
-        self.stage = "castle"
-        self.refresh_stats()
-
-    def enter_castle(self):
-        self.append_text("You arrive at the Enchanted Castle. A Bandit blocks the gate.")
-        minor = make_enemy("Bandit", difficulty=2)
-        self.start_battle(minor)
-        if not self.player.is_alive():
-            self.game_over("BAD", "You fell before the castle gate.")
-            return
-        # final branching decision
-        self.append_text("At the inner gate stands the Ancient Guardian.")
-        # present options via dialog
-        btns = QMessageBox()
-        btns.setWindowTitle("Final Choice")
-        btns.setText("What will you do before the Guardian?")
-        bef = btns.addButton("Befriend", QMessageBox.AcceptRole)
-        fig = btns.addButton("Fight", QMessageBox.DestructiveRole)
-        tri = btns.addButton("Trick", QMessageBox.ActionRole)
-        btns.exec_()
-        clicked = btns.clickedButton()
-        guardian = make_enemy("Dragon", difficulty=2)
-
-        if clicked == bef:
-            if self.player.has_charm or self.player.magic >= 8:
-                self.append_text("You speak with calm. The Guardian lowers its stance and accepts you. (Good Ending)")
-                self.game_over("GOOD", "You restored peace to the land.")
-                return
-            else:
-                self.append_text("Your words fail. The Guardian attacks!")
-                self.start_battle(guardian)
-                if not self.player.is_alive():
-                    self.game_over("BAD", "You were slain by the Guardian.")
-                    return
-                if self.player.helped_spirit:
-                    self.game_over("GOOD", "You defeated the Guardian and the land heals faster.")
-                else:
-                    self.game_over("NEUTRAL", "You defeated it, but the cost weighs on you.")
-                return
-
-        elif clicked == fig:
-            self.append_text("You decide to fight the Guardian.")
-            self.start_battle(guardian)
-            if not self.player.is_alive():
-                self.game_over("BAD", "You were broken by the Guardian.")
-                return
-            if self.player.helped_spirit:
-                self.game_over("GOOD", "Because you helped earlier, the land heals quickly.")
-            else:
-                self.game_over("NEUTRAL", "You won, but the aftermath is heavy.")
-            return
-
-        elif clicked == tri:
-            chance = 0.25 + (self.player.agility * 0.03) + (self.player.magic * 0.02)
-            if random.random() < chance:
-                self.append_text("Your ruse works and the Guardian lets you pass. (Good Ending)")
-                self.game_over("GOOD", "You slipped by and resolved things without bloodshed.")
-                return
-            else:
-                self.append_text("Trick failed. The Guardian attacks!")
-                self.start_battle(guardian)
-                if not self.player.is_alive():
-                    self.game_over("BAD", "You were defeated by the Guardian.")
-                    return
-                self.game_over("NEUTRAL", "You overcame the Guardian but at cost.")
-                return
-
-    # ---------------------------
-    # Battle management
-    # ---------------------------
-    def start_battle(self, enemy: Enemy):
-        """Initializes a battle. Control switches to battle mode."""
-        self.current_enemy = enemy
-        self.player.defending = False
-        self.append_text(f"Battle start: {self.player.name} vs {enemy.name}")
-        self.set_battle_mode(True)
-        self.refresh_stats()
-        # battle loop proceeds by user clicking actions. Enemy actions are executed after player's action.
-
-    def end_battle_if_needed(self):
-        e = self.current_enemy
-        p = self.player
-        if e and not e.is_alive():
-            self.append_text(f"You defeated {e.name}!")
-            if e.loot:
-                self.append_text(f"You found: {', '.join(e.loot)}")
-                p.inventory.extend(e.loot)
-            p.gold += e.level * 5
-            self.current_enemy = None
-            self.set_battle_mode(False)
-            self.refresh_stats()
-        elif not p.is_alive():
-            self.current_enemy = None
-            self.set_battle_mode(False)
-            # player death handled by caller (progress/enter_x)
-        # else battle continues
+        pygame.display.flip()
 
     def player_attack(self):
-        if not self._battle_ok(): return
-        e = self.current_enemy; p = self.player
-        crit_chance = min(30, 5 + p.agility * 2)
-        crit = random.randint(1, 100) <= crit_chance
-        dmg = calc_damage(p.strength, base=2, variance=4)
+        crit = random.random() < (0.05 + self.player.agility * 0.01)
+        base = 3 + self.player.strength
+        dmg = base + random.randint(0, 4)
         if crit:
-            dmg = int(dmg * 1.6)
-            self.append_text("Critical hit!")
-        e.hp -= dmg
-        e.hp = clamp(e.hp, 0, 9999)
-        self.append_text(f"You attack {e.name} for {dmg} damage.")
-        self.post_player_action()
-
-    def player_defend(self):
-        if not self._battle_ok(): return
-        self.player.defending = True
-        self.append_text("You brace yourself. Incoming damage will be reduced this turn.")
-        self.post_player_action()
+            dmg = int(dmg * 1.5)
+            self.append("Critical hit!")
+        self.enemy['hp'] -= dmg
+        self.append(f"You attack for {dmg} damage.")
 
     def player_magic(self):
-        if not self._battle_ok(): return
         cost = 6
-        p = self.player; e = self.current_enemy
-        if p.mp < cost:
-            self.append_text("Not enough MP!")
+        if self.player.mp < cost:
+            self.append("Not enough MP.")
             return
-        p.mp -= cost
-        dmg = calc_damage(0, base=4, variance=6, magic=True, att_mag=p.magic)
-        burn = False
-        if p.pclass == "Mage" and random.random() < 0.25:
-            burn = True
-        e.hp -= dmg
-        e.hp = clamp(e.hp, 0, 9999)
-        self.append_text(f"You cast a spell dealing {dmg} magic damage.")
-        if burn:
-            self.append_text(f"The {e.name} is burned for 3 extra damage!")
-            e.hp -= 3
-            e.hp = clamp(e.hp, 0, 9999)
-        self.post_player_action()
+        self.player.mp -= cost
+        dmg = self.player.magic + 4 + random.randint(0, 6)
+        self.enemy['hp'] -= dmg
+        self.append(f"You cast a spell for {dmg} magic damage.")
 
-    def player_flee(self):
-        if not self._battle_ok(): return
-        chance = 0.4 + self.player.agility * 0.03
-        if random.random() < chance:
-            self.append_text("You successfully fled the battle!")
-            # fleeing ends battle without victory
-            self.current_enemy = None
-            self.set_battle_mode(False)
-            self.refresh_stats()
-        else:
-            self.append_text("You failed to flee!")
-            self.post_player_action()
+    def player_defend(self):
+        self.player.defending = True
+        self.append("You brace to reduce incoming damage.")
 
-    def open_inventory(self):
-        if not self.player:
-            QMessageBox.information(self, "No character", "Create a character first.")
+    def player_use_item(self):
+        # pick first usable item: Small Potion, Mana Potion, Lucky Charm, Spirit Charm
+        if not self.player.inventory:
+            self.append("No items to use.")
             return
-        dlg = InventoryDialog(self.player, self)
-        dlg.exec_()
-        self.refresh_stats()
-
-    def post_player_action(self):
-        """Called after player took an action: check if enemy dead, else run enemy turn."""
-        self.end_battle_if_needed()
-        if self.current_enemy:  # enemy gets a turn
-            self.enemy_turn()
-            self.refresh_stats()
-            if not self.player.is_alive():
-                self.append_text("You have fallen in battle...")
-                # caller (progress) will check player life and show endings accordingly
-                self.set_battle_mode(False)
-            else:
-                self.end_battle_if_needed()
+        # open a tiny selection logic: use first restorative item found
+        for i, it in enumerate(self.player.inventory):
+            if it.name == "Small Potion":
+                self.player.hp = clamp(self.player.max_hp, self.player.hp + 20, self.player.max_hp)
+                self.append("Used Small Potion. Healed 20 HP.")
+                self.player.inventory.pop(i)
+                return
+            if it.name == "Mana Potion":
+                self.player.mp = clamp(self.player.mp + 12, 0, self.player.max_mp)
+                self.append("Used Mana Potion. Restored MP.")
+                self.player.inventory.pop(i)
+                return
+            if it.name == "Lucky Charm":
+                self.player.hp = min(self.player.max_hp, self.player.hp + 8)
+                self.player.gold += 5
+                self.append("Lucky Charm used: HP +8, Gold +5.")
+                self.player.inventory.pop(i)
+                return
+            if it.name == "Spirit Charm":
+                self.player.has_charm = True
+                self.append("Spirit Charm hums; you feel protected.")
+                self.player.inventory.pop(i)
+                return
+        # nothing used
+        self.append("No usable items found right now.")
 
     def enemy_turn(self):
-        e = self.current_enemy; p = self.player
-        if not e or not e.is_alive(): return
-        # special move sometimes
-        if e.special and random.random() < 0.2:
-            e.special(p, e, self)
+        if self.enemy['hp'] <= 0:
             return
-        base_hit = 75
-        dodge = min(50, p.agility * 3)
-        hit_roll = random.randint(1, 100)
-        if hit_roll <= base_hit - dodge:
-            dmg = calc_damage(e.strength, base=2, variance=3)
-            if p.defending:
+        # simple enemy action
+        hit_chance = 0.7 - (self.player.agility * 0.01)
+        if random.random() < hit_chance:
+            dmg = self.enemy['str'] + random.randint(0, 3)
+            if getattr(self.player, "defending", False):
                 dmg = dmg // 2
-            p.hp -= dmg
-            p.hp = clamp(p.hp, 0, p.max_hp)
-            self.append_text(f"{e.name} hits you for {dmg} damage.")
+            self.player.hp -= dmg
+            self.append(f"{self.enemy['name']} hits you for {dmg} damage.")
         else:
-            self.append_text(f"{e.name} tries to hit but you dodge!")
+            self.append(f"{self.enemy['name']} misses!")
 
-    def _battle_ok(self) -> bool:
-        if not self.player or not self.current_enemy:
-            QMessageBox.information(self, "No battle", "There is no ongoing battle.")
-            return False
-        return True
-
-    # ---------------------------
-    # Ending and game over
-    # ---------------------------
-    def game_over(self, result: str, message: str):
-        # disable actions and display ending
-        self.append_text(f"\n=== Ending: {result} ===\n{message}")
-        if result == "GOOD":
-            self.append_text("Good Ending: The land heals and you are celebrated.")
-        elif result == "NEUTRAL":
-            self.append_text("Neutral Ending: You prevailed but at a price.")
+    def attempt_flee(self):
+        chance = 0.35 + self.player.agility * 0.02
+        if random.random() < chance:
+            self.append("You fled successfully.")
+            self.finished = True
+            self.victory = False
         else:
-            self.append_text("Bad Ending: Darkness claims the land...")
-        QMessageBox.information(self, f"Game Over - {result}", message)
-        self.stage = "done"
-        self.set_battle_mode(False)
-        self.refresh_stats()
+            self.append("Flee failed!")
+            self.enemy_turn()
 
-# ---------------------------
-# Entry point
-# ---------------------------
+    def run(self):
+        # main loop for combat; returns dict with outcome
+        while not self.finished:
+            dt = self.clock.tick(FPS) / 1000.0
+            self.draw()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit(0)
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_a:
+                        self.player_attack()
+                    elif event.key == pygame.K_m:
+                        self.player_magic()
+                    elif event.key == pygame.K_d:
+                        self.player_defend()
+                    elif event.key == pygame.K_i:
+                        self.player_use_item()
+                    elif event.key == pygame.K_f:
+                        self.attempt_flee()
+                    else:
+                        continue
+                    # after player action, check enemy dead
+                    if self.enemy['hp'] <= 0:
+                        self.append(f"You defeated the {self.enemy['name']}!")
+                        self.player.gold += self.enemy['lvl'] * 5
+                        # simple loot: chance to drop small potion or mana potion
+                        if random.random() < 0.6:
+                            drop = Item("Small Potion", "Heals 20 HP")
+                            self.player.inventory.append(drop)
+                            self.append("Enemy dropped Small Potion.")
+                        self.finished = True
+                        self.victory = True
+                        break
+                    # enemy gets a turn
+                    self.enemy_turn()
+                    # reset defend flag
+                    self.player.defending = False
+                    # check player death
+                    if self.player.hp <= 0:
+                        self.append("You were defeated...")
+                        self.finished = True
+                        self.victory = False
+                        break
+        # exit combat loop
+        return {"victory": self.victory, "fled": (not self.victory and self.enemy['hp']>0 and self.finished)}
+
+# ---- Main Game class ----
+
+class Game:
+    def __init__(self):
+        pygame.init()
+        pygame.display.set_caption("Top-down RPG (Pygame Demo)")
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.clock = pygame.time.Clock()
+        self.running = True
+        self.scene_index = 0
+        self.scenes = [create_village_scene(), create_forest_scene(), create_castle_scene()]
+        self.scene = self.scenes[self.scene_index]
+        self.player_obj = GameObject(80, 80, 28, 36, "Player")
+        # default PlayerState (lets user choose class at start)
+        self.player_state = None  # will be set via create_player()
+        # small UI flags
+        self.show_inventory = False
+        self.message = "Press N to create a character and start."
+        self.show_help = True
+        # seed randomness
+        random.seed()
+
+    def create_player(self):
+        # Minimal terminal-driven selection (works even in window)
+        # In a fuller version you'd implement GUI forms; here keep simple:
+        name = "Hero"
+        pclass = "Warrior"
+        # interactive choice via console input isn't great in GUI; instead random or defaults
+        # To keep it simple, present a small on-screen prompt choices (press 1/2/3)
+        choosing = True
+        while choosing:
+            # display prompt and wait for key
+            self.screen.fill((20, 20, 30))
+            draw_text(self.screen, "Create your character", SCREEN_WIDTH//2, 80, size=36, color=WHITE, center=True)
+            draw_text(self.screen, "Press 1 for Warrior, 2 for Mage, 3 for Rogue", SCREEN_WIDTH//2, 160, size=20, color=WHITE, center=True)
+            pygame.display.flip()
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit(0)
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_1 or ev.key == pygame.K_KP1:
+                        name = "Hero"
+                        pclass = "Warrior"
+                        choosing = False
+                    elif ev.key == pygame.K_2 or ev.key == pygame.K_KP2:
+                        name = "Aria"
+                        pclass = "Mage"
+                        choosing = False
+                    elif ev.key == pygame.K_3 or ev.key == pygame.K_KP3:
+                        name = "Shade"
+                        pclass = "Rogue"
+                        choosing = False
+            self.clock.tick(FPS)
+
+        # set stats depending on class
+        ps = PlayerState()
+        ps.name = name
+        ps.pclass = pclass
+        if pclass == "Warrior":
+            ps.strength = 8; ps.agility = 5; ps.magic = 2; ps.max_hp = 40; ps.max_mp = 10
+            ps.hp = ps.max_hp; ps.mp = ps.max_mp
+            ps.inventory = [Item("Small Potion","Heals 20 HP"), Item("Lucky Charm","Small heal + gold")]
+        elif pclass == "Mage":
+            ps.strength = 2; ps.agility = 4; ps.magic = 9; ps.max_hp = 26; ps.max_mp = 30
+            ps.hp = ps.max_hp; ps.mp = ps.max_mp
+            ps.inventory = [Item("Mana Potion","Restore MP"), Item("Mana Potion","Restore MP")]
+        elif pclass == "Rogue":
+            ps.strength = 6; ps.agility = 8; ps.magic = 4; ps.max_hp = 32; ps.max_mp = 15
+            ps.hp = ps.max_hp; ps.mp = ps.max_mp
+            ps.inventory = [Item("Small Potion","Heals 20 HP"), Item("Dagger","A small blade")]
+        ps.gold = 12
+        self.player_state = ps
+        self.message = f"Welcome, {ps.name} the {ps.pclass}! Use arrow keys/WASD to move. Press I for inventory. Press H to toggle help."
+        return ps
+
+    def world_to_scene(self, new_index):
+        self.scene_index = new_index
+        self.scene = self.scenes[self.scene_index]
+        # reposition player near top-left for new map
+        self.player_obj.x = 80
+        self.player_obj.y = 80
+
+    def handle_item_pickup(self, go_obj, item: Item):
+        # add item to inventory and remove it from scene
+        self.player_state.inventory.append(item)
+        self.scene.items = [(g,i) for (g,i) in self.scene.items if g != go_obj]
+        self.message = f"Picked up {item.name}!"
+
+    def handle_npc_interaction(self, npc: GameObject):
+        # Branch on scene and npc name
+        if self.scene.name == "Village" and npc.name == "Elder":
+            # simple dialog: offer small gold or advice
+            self.message = "Elder: 'Training helps. Rest at the inn or buy potions.' (Press N to continue exploring.)"
+        elif self.scene.name == "Forest" and npc.name == "Trapped Spirit":
+            # choice: help or ignore
+            chosen = self.ask_choice("A trapped spirit begs for help. Help it? (Y/N)")
+            if chosen == 'Y':
+                self.player_state.helped_spirit = True
+                self.player_state.inventory.append(Item("Spirit Charm", "A protective charm"))
+                self.player_state.has_charm = True
+                self.message = "You freed the spirit. It grants you a Spirit Charm."
+            else:
+                # ignore -> get Lucky Charm later via an item already placed
+                self.message = "You ignored the spirit. You feel uneasy."
+        elif self.scene.name == "Castle" and npc.name == "Ancient Guardian":
+            # final branching choice - handled elsewhere when reaching central area
+            self.message = "The Ancient Guardian watches you. Press N to interact with Guardian."
+        else:
+            self.message = f"You talk to {npc.name}. They nod."
+
+    def ask_choice(self, prompt_text) -> str:
+        """Helper: display prompt and wait for Y or N press. Returns 'Y' or 'N'."""
+        asking = True
+        result = 'N'
+        while asking:
+            self.screen.fill((30, 30, 30))
+            draw_text(self.screen, prompt_text, SCREEN_WIDTH//2, SCREEN_HEIGHT//2 - 20, size=28, color=WHITE, center=True)
+            draw_text(self.screen, "Press Y or N", SCREEN_WIDTH//2, SCREEN_HEIGHT//2 + 30, size=20, color=WHITE, center=True)
+            pygame.display.flip()
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit(0)
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_y:
+                        result = 'Y'; asking = False
+                    elif ev.key == pygame.K_n:
+                        result = 'N'; asking = False
+            self.clock.tick(FPS)
+        return result
+
+    def transition_to_combat(self, enemy_obj: GameObject):
+        # create and run combat screen, using enemy_obj.name
+        cs = CombatScreen(self.screen, self.clock, self.player_state, enemy_obj.name)
+        result = cs.run()
+        # if victory, remove enemy from scene
+        if result['victory']:
+            self.scene.enemies = [e for e in self.scene.enemies if e != enemy_obj]
+            self.message = f"Defeated {enemy_obj.name}."
+        else:
+            if result.get("fled", False):
+                self.message = "You fled the combat."
+            else:
+                # player was defeated: end game
+                self.message = "You were defeated..."
+        # check for player death (hp <= 0)
+        if self.player_state.hp <= 0:
+            self.end_game("BAD", "You have fallen in battle.")
+        return result
+
+    def end_game(self, ending_type: str, detail: str):
+        # show final message and stop running main loop
+        self.message = f"=== Ending: {ending_type} === {detail}"
+        # display an ending screen then stop
+        self.display_ending_screen(ending_type, detail)
+        self.running = False
+
+    def display_ending_screen(self, typ, text):
+        showing = True
+        while showing:
+            self.screen.fill((10, 10, 10))
+            draw_text(self.screen, f"Ending: {typ}", SCREEN_WIDTH//2, 120, size=44, color=WHITE, center=True)
+            draw_text(self.screen, text, SCREEN_WIDTH//2, 200, size=22, color=WHITE, center=True)
+            draw_text(self.screen, "Press ESC to quit or R to restart.", SCREEN_WIDTH//2, 420, size=20, color=WHITE, center=True)
+            pygame.display.flip()
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit(0)
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_ESCAPE:
+                        pygame.quit(); sys.exit(0)
+                    if ev.key == pygame.K_r:
+                        # restart whole app by re-running main game loop
+                        showing = False
+                        main()
+            self.clock.tick(FPS)
+
+    def final_guardian_event(self, guardian_obj: GameObject):
+        # Player stands before Guardian; provide three options: Befriend / Fight / Trick
+        # Show on-screen menu
+        chosen = None
+        while chosen is None:
+            self.screen.fill((30,30,40))
+            draw_text(self.screen, "The Ancient Guardian stands before you.", SCREEN_WIDTH//2, 80, size=28, color=WHITE, center=True)
+            draw_text(self.screen, "[B]efriend   [F]ight   [T]rick", SCREEN_WIDTH//2, 160, size=24, color=WHITE, center=True)
+            draw_text(self.screen, "Press the corresponding key to choose.", SCREEN_WIDTH//2, 220, size=18, color=WHITE, center=True)
+            pygame.display.flip()
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    pygame.quit(); sys.exit(0)
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_b:
+                        chosen = 'B'
+                    elif ev.key == pygame.K_f:
+                        chosen = 'F'
+                    elif ev.key == pygame.K_t:
+                        chosen = 'T'
+            self.clock.tick(FPS)
+        # Resolve choices
+        if chosen == 'B':
+            # require spirit charm or high magic
+            if self.player_state.has_charm or self.player_state.magic >= 8:
+                self.end_game("GOOD", "You spoke truly; the guardian accepts peace.")
+            else:
+                # fail, force combat
+                self.message = "Your words fail. The Guardian attacks!"
+                res = self.transition_to_combat(guardian_obj)
+                if not res['victory']:
+                    self.end_game("BAD", "You failed to subdue the Guardian.")
+                else:
+                    # if helped spirit earlier -> good, else neutral
+                    if self.player_state.helped_spirit:
+                        self.end_game("GOOD", "You defeated it and the land heals faster (you helped spirit earlier).")
+                    else:
+                        self.end_game("NEUTRAL", "You defeated it, but the cost was heavy.")
+        elif chosen == 'F':
+            res = self.transition_to_combat(guardian_obj)
+            if not res['victory']:
+                self.end_game("BAD", "The Guardian defeated you.")
+            else:
+                if self.player_state.helped_spirit:
+                    self.end_game("GOOD", "You defeated the Guardian; the spirits aid recovery.")
+                else:
+                    self.end_game("NEUTRAL", "You won, but peace will take time.")
+        elif chosen == 'T':
+            chance = 0.25 + (self.player_state.agility * 0.03) + (self.player_state.magic * 0.02)
+            if random.random() < chance:
+                self.end_game("GOOD", "Your trick works and the Guardian steps aside.")
+            else:
+                self.message = "Trick failed; Guardian attacks!"
+                res = self.transition_to_combat(guardian_obj)
+                if not res['victory']:
+                    self.end_game("BAD", "You were defeated while attempting a trick.")
+                else:
+                    self.end_game("NEUTRAL", "You prevailed but the victory feels hollow.")
+        else:
+            self.message = "You hesitated and the moment passed."
+
+    # ---- Main game loop ----
+    def run(self):
+        # Create player first
+        if not self.player_state:
+            self.create_player()
+        dt = 0
+        while self.running:
+            # handle events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_i:
+                        self.show_inventory = not self.show_inventory
+                    elif event.key == pygame.K_h:
+                        self.show_help = not self.show_help
+                    elif event.key == pygame.K_n:
+                        # advance to next scene when on edges or interact with Guardian
+                        # if at castle and near guardian, run final event
+                        # check if near guardian in castle
+                        if self.scene.name == "Castle":
+                            # find guardian npc
+                            for npc in self.scene.npcs:
+                                if npc.name == "Ancient Guardian":
+                                    if self.player_obj.rect().colliderect(npc.rect()):
+                                        self.final_guardian_event(npc)
+                                        break
+                        # else advance scene
+                        if self.scene_index < len(self.scenes) - 1:
+                            self.world_to_scene(self.scene_index + 1)
+                            self.message = f"Traveled to {self.scene.name}."
+                    elif event.key == pygame.K_r:
+                        # quick heal/test
+                        self.player_state.hp = self.player_state.max_hp
+                        self.player_state.mp = self.player_state.max_mp
+                    elif event.key == pygame.K_ESCAPE:
+                        self.running = False
+
+            # movement handling
+            keys = pygame.key.get_pressed()
+            vx = vy = 0
+            if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+                vx = -1
+            if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+                vx = 1
+            if keys[pygame.K_UP] or keys[pygame.K_w]:
+                vy = -1
+            if keys[pygame.K_DOWN] or keys[pygame.K_s]:
+                vy = 1
+            # normalize diagonal
+            if vx != 0 and vy != 0:
+                vx *= 0.7071; vy *= 0.7071
+            # move with delta
+            move_x = vx * PLAYER_SPEED * (self.clock.get_time() / 1000.0)
+            move_y = vy * PLAYER_SPEED * (self.clock.get_time() / 1000.0)
+            # tentative move and collision with scene obstacles
+            next_rect = self.player_obj.rect().move(move_x, 0)
+            blocked = False
+            for obs in self.scene.obstacles:
+                if next_rect.colliderect(obs):
+                    blocked = True; break
+            if not blocked:
+                self.player_obj.x += move_x
+            next_rect = self.player_obj.rect().move(0, move_y)
+            blocked = False
+            for obs in self.scene.obstacles:
+                if next_rect.colliderect(obs):
+                    blocked = True; break
+            if not blocked:
+                self.player_obj.y += move_y
+
+            # check item pickups
+            for go, item in list(self.scene.items):
+                if self.player_obj.rect().colliderect(go.rect()):
+                    self.handle_item_pickup(go, item)
+
+            # check NPC interactions proximity (press N to interact)
+            # But we also handle if player walks directly onto NPC -> auto-interact
+            for npc in self.scene.npcs:
+                if self.player_obj.rect().colliderect(npc.rect()):
+                    self.handle_npc_interaction(npc)
+
+            # check enemy collision -> start combat
+            for en in list(self.scene.enemies):
+                if self.player_obj.rect().colliderect(en.rect()):
+                    # start combat
+                    res = self.transition_to_combat(en)
+                    if not self.player_state.hp > 0:
+                        self.running = False
+                        break
+
+            # drawing scene
+            self.scene.draw(self.screen)
+            # draw player
+            pygame.draw.rect(self.screen, PLAYER_COLOR, self.player_obj.rect())
+            draw_text(self.screen, self.player_state.name if self.player_state else "NoName", self.player_obj.x, self.player_obj.y - 16, size=14)
+            # UI HUD
+            draw_text(self.screen, f"Location: {self.scene.name}", 12, 8, size=18)
+            draw_text(self.screen, f"HP: {self.player_state.hp}/{self.player_state.max_hp}  MP: {self.player_state.mp}/{self.player_state.max_mp}  Gold: {self.player_state.gold}", 12, 30, size=16)
+            if self.show_help:
+                draw_text(self.screen, "Move: Arrows/WASD  Inventory: I  Next Scene / Interact: N  Help: H  Restart: R", 12, SCREEN_HEIGHT - 28, size=16)
+            # message box
+            pygame.draw.rect(self.screen, (230, 230, 230), (10, SCREEN_HEIGHT - 90, SCREEN_WIDTH - 20, 60))
+            draw_text(self.screen, f"{self.message}", 18, SCREEN_HEIGHT - 82, size=18)
+
+            # inventory overlay
+            if self.show_inventory:
+                pygame.draw.rect(self.screen, (30,30,30), (220, 100, 520, 420))
+                draw_text(self.screen, "Inventory (press I to close)", SCREEN_WIDTH//2, 120, size=22, color=WHITE, center=True)
+                for i, it in enumerate(self.player_state.inventory):
+                    draw_text(self.screen, f"{i+1}. {it.name} - {it.description}", 260, 160 + i*28, size=18, color=WHITE)
+            pygame.display.flip()
+            self.clock.tick(FPS)
+        pygame.quit()
+
+# ---- Entry point ----
 
 def main():
-    app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec_())
+    g = Game()
+    g.run()
 
 if __name__ == "__main__":
-    random.seed()
     main()
